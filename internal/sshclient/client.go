@@ -297,11 +297,30 @@ END {
   print tot+0, totb+0
 }`
 
-	cmd := fmt.Sprintf(
+	// Cache file is keyed by log path + bucket size (not since, which changes every second).
+	// Cache is valid as long as no new .gz file appeared since it was written.
+	// A log rotation (every ~9 min on high-traffic servers) is the only invalidation event.
+	cacheKey := strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(base)
+	cachePath := fmt.Sprintf("/tmp/caddyview_%s_%d.cache", cacheKey, bucketSecs)
+
+	findPipe := fmt.Sprintf(
 		`find %s -name '%s*' -type f -mtime -%d 2>/dev/null | sort -r | `+
 			`while read f; do case "$f" in *.gz) zcat "$f" ;; *) cat "$f" ;; esac; done 2>/dev/null | `+
 			`awk -v cutoff=%d -v bucket=%d '%s'`,
 		dir, base, maxAgeDays+1, since, bucketSecs, awkProg,
+	)
+
+	// Wrap with server-side cache: hit → instant cat; miss → run awk and tee to cache atomically.
+	cmd := fmt.Sprintf(
+		`CACHE=%s; `+
+			`LATEST=$(find %s -name '%s*.gz' -mtime -%d 2>/dev/null | sort | tail -1); `+
+			`if [ -f "$CACHE" ] && { [ -z "$LATEST" ] || [ "$CACHE" -nt "$LATEST" ]; }; then `+
+			`cat "$CACHE"; `+
+			`else `+
+			`TMPFILE=$(mktemp /tmp/caddyview.XXXXXX 2>/dev/null || echo /tmp/caddyview_fallback.tmp); `+
+			`%s | tee "$TMPFILE" && mv "$TMPFILE" "$CACHE" 2>/dev/null || cat "$TMPFILE" 2>/dev/null; `+
+			`fi`,
+		cachePath, dir, base, maxAgeDays+1, findPipe,
 	)
 
 	out, err := c.RunCommand(cmd)
