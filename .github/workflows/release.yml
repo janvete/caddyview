@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries and archives
+        run: |
+          VERSION=${{ github.ref_name }}
+          mkdir -p dist
+
+          for PAIR in darwin/arm64 darwin/amd64 linux/amd64; do
+            OS=${PAIR%/*}
+            ARCH=${PAIR#*/}
+            GOOS=$OS GOARCH=$ARCH go build -ldflags="-s -w" -o dist/caddyview-${OS}-${ARCH} .
+            STAGING=$(mktemp -d)
+            cp dist/caddyview-${OS}-${ARCH} ${STAGING}/caddyview
+            tar -czf dist/caddyview-${VERSION}-${OS}-${ARCH}.tar.gz -C ${STAGING} caddyview
+            rm -rf ${STAGING}
+          done
+
+          echo "=== SHA256 checksums ==="
+          sha256sum dist/*.tar.gz
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${{ github.ref_name }}
+          gh release create "$VERSION" dist/*.tar.gz \
+            --title "$VERSION" \
+            --generate-notes
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION=${{ github.ref_name }}
+          VER=${VERSION#v}
+          SHA_ARM64=$(sha256sum dist/caddyview-${VERSION}-darwin-arm64.tar.gz | awk '{print $1}')
+          SHA_AMD64=$(sha256sum dist/caddyview-${VERSION}-darwin-amd64.tar.gz | awk '{print $1}')
+          SHA_LINUX=$(sha256sum dist/caddyview-${VERSION}-linux-amd64.tar.gz  | awk '{print $1}')
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/janvete/homebrew-caddyview.git" tap
+
+          cat > tap/Formula/caddyview.rb << FORMULA
+          class Caddyview < Formula
+            desc "TUI SSH monitor for Caddy web server logs"
+            homepage "https://github.com/janvete/caddyview"
+            version "${VER}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/janvete/caddyview/releases/download/${VERSION}/caddyview-${VERSION}-darwin-arm64.tar.gz"
+                sha256 "${SHA_ARM64}"
+              else
+                url "https://github.com/janvete/caddyview/releases/download/${VERSION}/caddyview-${VERSION}-darwin-amd64.tar.gz"
+                sha256 "${SHA_AMD64}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel?
+                url "https://github.com/janvete/caddyview/releases/download/${VERSION}/caddyview-${VERSION}-linux-amd64.tar.gz"
+                sha256 "${SHA_LINUX}"
+              end
+            end
+
+            def install
+              bin.install "caddyview"
+            end
+
+            test do
+              assert_match "TUI monitor", shell_output("#{bin}/caddyview --help")
+            end
+          end
+          FORMULA
+
+          cd tap
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/caddyview.rb
+          git commit -m "chore: bump caddyview to ${VERSION}"
+          git push
