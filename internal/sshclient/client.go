@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/janvete/caddyview/internal/parser"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -240,9 +241,13 @@ func parseCPUStat(raw string) float64 {
 	return (totalDiff - idleDiff) / totalDiff * 100
 }
 
-// LoadHistoricalLines reads log lines newer than `since` from the main log file
-// and any rotated versions (access.log.1, access.log.2.gz, etc.).
-func (c *Client) LoadHistoricalLines(logPath string, since int64) ([]string, error) {
+// LoadAggregatedHistory aggregates log data on the remote server using awk,
+// returning only summary buckets instead of raw lines. This is critical for
+// high-traffic servers where raw line transfer would be impractical.
+//
+// bucketSecs: size of each time bucket in seconds (e.g. 3600 for hourly)
+// maxAgeDays: find only files modified within this many days (performance filter)
+func (c *Client) LoadAggregatedHistory(logPath string, since, bucketSecs int64, maxAgeDays int) (*parser.AggregatedHistory, error) {
 	lastSlash := strings.LastIndex(logPath, "/")
 	dir, base := "/", logPath
 	if lastSlash >= 0 {
@@ -253,22 +258,55 @@ func (c *Client) LoadHistoricalLines(logPath string, since int64) ([]string, err
 		base = logPath[lastSlash+1:]
 	}
 
-	// Find all rotated log files, cat/zcat them, filter JSON lines by ts field.
-	// awk: find offset of "ts": then parse the numeric value after it.
+	// awk aggregation script — runs entirely on the server.
+	// Parses JSON log lines, groups by time bucket, outputs summary.
+	// Uses only POSIX-compatible awk constructs.
+	awkProg := `
+BEGIN { OFS=" " }
+{
+  if (index($0,"\"msg\":\"handled request\"") == 0) next
+  p = index($0,"\"ts\":")
+  if (p == 0) next
+  ts = substr($0,p+5,20)+0
+  if (ts < cutoff) next
+  b = int(ts/bucket)*bucket
+  p = index($0,"\"status\":")
+  st = (p>0) ? substr($0,p+9,5)+0 : 0
+  p = index($0,"\"size\":")
+  sz = (p>0) ? substr($0,p+7,15)+0 : 0
+  p = index($0,"\"host\":\"")
+  if (p>0) { rest=substr($0,p+8); q=index(rest,"\""); ho=(q>0)?substr(rest,1,q-1):"?" } else ho="?"
+  p = index($0,"\"remote_ip\":\"")
+  if (p>0) { rest=substr($0,p+13); q=index(rest,"\""); ip=(q>0)?substr(rest,1,q-1):"?" } else ip="?"
+  bc[b]++; bb[b]+=sz
+  if (st>=500) bs5[b]++
+  else if (st>=400) bs4[b]++
+  else if (st>=300) bs3[b]++
+  else if (st>=200) bs2[b]++
+  hc[ho]++; ic[ip]++
+  tot++; totb+=sz
+}
+END {
+  print "BUCKETS"
+  for (b in bc) print b, bc[b], bb[b], bs2[b]+0, bs3[b]+0, bs4[b]+0, bs5[b]+0
+  print "HOSTS"
+  for (h in hc) print hc[h], h
+  print "IPS"
+  for (i in ic) print ic[i], i
+  print "TOTALS"
+  print tot+0, totb+0
+}`
+
 	cmd := fmt.Sprintf(
-		`find %s -name '%s*' -type f 2>/dev/null | sort -r | `+
+		`find %s -name '%s*' -type f -mtime -%d 2>/dev/null | sort -r | `+
 			`while read f; do case "$f" in *.gz) zcat "$f" ;; *) cat "$f" ;; esac; done 2>/dev/null | `+
-			`awk -v c=%d '{p=index($0,"\"ts\":"); if(p>0){v=substr($0,p+5,20)+0; if(v>=c) print}}'`,
-		dir, base, since,
+			`awk -v cutoff=%d -v bucket=%d '%s'`,
+		dir, base, maxAgeDays+1, since, bucketSecs, awkProg,
 	)
 
 	out, err := c.RunCommand(cmd)
 	if err != nil && strings.TrimSpace(out) == "" {
-		return nil, fmt.Errorf("failed to read historical logs: %w", err)
+		return nil, fmt.Errorf("aggregation failed: %w", err)
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		return nil, nil
-	}
-	return strings.Split(out, "\n"), nil
+	return parser.ParseAggregatedOutput(out)
 }

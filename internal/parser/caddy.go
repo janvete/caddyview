@@ -2,6 +2,8 @@ package parser
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -12,10 +14,10 @@ type LogEntry struct {
 	Level     string  `json:"level"`
 	Logger    string  `json:"logger"`
 	Request   struct {
-		Method string `json:"method"`
-		URI    string `json:"uri"`
-		Host   string `json:"host"`
-		Proto  string `json:"proto"`
+		Method   string `json:"method"`
+		URI      string `json:"uri"`
+		Host     string `json:"host"`
+		Proto    string `json:"proto"`
 		RemoteIP string `json:"remote_ip"`
 	} `json:"request"`
 	Duration float64 `json:"duration"`
@@ -39,7 +41,7 @@ func ParseLine(line string) *LogEntry {
 	if err := json.Unmarshal([]byte(line), &entry); err != nil {
 		return nil
 	}
-	if entry.Request.Host == "" {
+	if entry.Request.Host == "" || entry.Status == 0 {
 		return nil
 	}
 	return &entry
@@ -56,7 +58,8 @@ func ParseLines(lines []string) []*LogEntry {
 	return entries
 }
 
-// Stats holds aggregated metrics for a time window.
+// -- Stats (used for live view and derived from AggregatedHistory for history) --
+
 type Stats struct {
 	TotalRequests int64
 	TotalBytes    int64
@@ -90,7 +93,6 @@ func (s *Stats) Add(e *LogEntry) {
 	}
 }
 
-// BytesPerSec calculates transfer rate given a window duration in seconds.
 func (s *Stats) BytesPerSec(windowSecs float64) float64 {
 	if windowSecs <= 0 {
 		return 0
@@ -98,14 +100,6 @@ func (s *Stats) BytesPerSec(windowSecs float64) float64 {
 	return float64(s.TotalBytes) / windowSecs
 }
 
-// Bucket aggregates entries into fixed time buckets for the history view.
-type Bucket struct {
-	Time     time.Time
-	Requests int64
-	Bytes    int64
-}
-
-// ComputeStats builds a Stats object from a slice of log entries.
 func ComputeStats(entries []*LogEntry) *Stats {
 	s := NewStats()
 	for _, e := range entries {
@@ -114,12 +108,18 @@ func ComputeStats(entries []*LogEntry) *Stats {
 	return s
 }
 
-// Bucketize groups entries into buckets of the given duration.
+// -- Bucket (time-series bar chart data) --------------------------------------
+
+type Bucket struct {
+	Time     time.Time
+	Requests int64
+	Bytes    int64
+}
+
 func Bucketize(entries []*LogEntry, bucketSize time.Duration) []Bucket {
 	if len(entries) == 0 {
 		return nil
 	}
-
 	buckets := map[int64]*Bucket{}
 	for _, e := range entries {
 		t := e.Time().Truncate(bucketSize)
@@ -130,10 +130,131 @@ func Bucketize(entries []*LogEntry, bucketSize time.Duration) []Bucket {
 		buckets[key].Requests++
 		buckets[key].Bytes += e.Size
 	}
-
 	result := make([]Bucket, 0, len(buckets))
 	for _, b := range buckets {
 		result = append(result, *b)
 	}
 	return result
+}
+
+// -- AggregatedHistory (server-side aggregation result) -----------------------
+
+// AggregatedBucket is one time bucket returned by server-side awk aggregation.
+type AggregatedBucket struct {
+	Time                          time.Time
+	Requests, Bytes               int64
+	Status2xx, Status3xx, Status4xx, Status5xx int64
+}
+
+// AggregatedHistory holds the full result of a server-side history aggregation.
+type AggregatedHistory struct {
+	Buckets    []AggregatedBucket
+	TopHosts   map[string]int64
+	TopIPs     map[string]int64
+	TotalReqs  int64
+	TotalBytes int64
+}
+
+// ToStats converts aggregated history to a Stats object for use in the TUI panels.
+func (h *AggregatedHistory) ToStats() *Stats {
+	s := NewStats()
+	s.TotalRequests = h.TotalReqs
+	s.TotalBytes = h.TotalBytes
+	s.TopHosts = h.TopHosts
+	s.TopIPs = h.TopIPs
+	for _, b := range h.Buckets {
+		s.StatusCodes[200] += b.Status2xx
+		s.StatusCodes[301] += b.Status3xx
+		s.StatusCodes[404] += b.Status4xx
+		s.StatusCodes[500] += b.Status5xx
+	}
+	return s
+}
+
+// ToBuckets converts aggregated buckets to the Bucket slice used by the bar chart.
+func (h *AggregatedHistory) ToBuckets() []Bucket {
+	out := make([]Bucket, len(h.Buckets))
+	for i, ab := range h.Buckets {
+		out[i] = Bucket{Time: ab.Time, Requests: ab.Requests, Bytes: ab.Bytes}
+	}
+	return out
+}
+
+// ParseAggregatedOutput parses the output of the server-side awk aggregation script.
+//
+// Format:
+//
+//	BUCKETS
+//	<unix_ts> <count> <bytes> <2xx> <3xx> <4xx> <5xx>
+//	HOSTS
+//	<count> <host>
+//	IPS
+//	<count> <ip>
+//	TOTALS
+//	<total_reqs> <total_bytes>
+func ParseAggregatedOutput(raw string) (*AggregatedHistory, error) {
+	h := &AggregatedHistory{
+		TopHosts: make(map[string]int64),
+		TopIPs:   make(map[string]int64),
+	}
+
+	section := ""
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		switch line {
+		case "BUCKETS", "HOSTS", "IPS", "TOTALS":
+			section = line
+			continue
+		}
+
+		fields := strings.Fields(line)
+		switch section {
+		case "BUCKETS":
+			if len(fields) < 7 {
+				continue
+			}
+			ts, err := strconv.ParseInt(fields[0], 10, 64)
+			if err != nil {
+				continue
+			}
+			ab := AggregatedBucket{Time: time.Unix(ts, 0)}
+			ab.Requests, _ = strconv.ParseInt(fields[1], 10, 64)
+			ab.Bytes, _ = strconv.ParseInt(fields[2], 10, 64)
+			ab.Status2xx, _ = strconv.ParseInt(fields[3], 10, 64)
+			ab.Status3xx, _ = strconv.ParseInt(fields[4], 10, 64)
+			ab.Status4xx, _ = strconv.ParseInt(fields[5], 10, 64)
+			ab.Status5xx, _ = strconv.ParseInt(fields[6], 10, 64)
+			h.Buckets = append(h.Buckets, ab)
+
+		case "HOSTS":
+			if len(fields) < 2 {
+				continue
+			}
+			count, _ := strconv.ParseInt(fields[0], 10, 64)
+			host := strings.Join(fields[1:], " ")
+			h.TopHosts[host] = count
+
+		case "IPS":
+			if len(fields) < 2 {
+				continue
+			}
+			count, _ := strconv.ParseInt(fields[0], 10, 64)
+			h.TopIPs[fields[1]] = count
+
+		case "TOTALS":
+			if len(fields) < 2 {
+				continue
+			}
+			h.TotalReqs, _ = strconv.ParseInt(fields[0], 10, 64)
+			h.TotalBytes, _ = strconv.ParseInt(fields[1], 10, 64)
+		}
+	}
+
+	if section == "" {
+		return nil, fmt.Errorf("no aggregation output received from server")
+	}
+	return h, nil
 }

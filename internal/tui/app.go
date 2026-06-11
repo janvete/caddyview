@@ -86,7 +86,6 @@ var (
 const historyRefreshInterval = 5 * time.Minute
 
 type historyState struct {
-	entries  []*parser.LogEntry
 	stats    *parser.Stats
 	buckets  []parser.Bucket
 	loaded   bool
@@ -106,7 +105,7 @@ type sysStatsMsg struct {
 }
 type historyLoadedMsg struct {
 	tab     viewTab
-	entries []*parser.LogEntry
+	agg     *parser.AggregatedHistory
 	err     error
 }
 type errMsg struct{ err error }
@@ -200,12 +199,14 @@ func drainLines(ch chan string) tea.Cmd {
 
 func loadHistory(client *sshclient.Client, logPath string, tab viewTab) tea.Cmd {
 	since := time.Now().Add(-tabWindow(tab)).Unix()
+	bucketSecs := int64(tabBucketSize(tab).Seconds())
+	maxAgeDays := int(tabWindow(tab).Hours()/24) + 1
 	return func() tea.Msg {
-		lines, err := client.LoadHistoricalLines(logPath, since)
+		agg, err := client.LoadAggregatedHistory(logPath, since, bucketSecs, maxAgeDays)
 		if err != nil {
 			return historyLoadedMsg{tab: tab, err: err}
 		}
-		return historyLoadedMsg{tab: tab, entries: parser.ParseLines(lines)}
+		return historyLoadedMsg{tab: tab, agg: agg}
 	}
 }
 
@@ -265,10 +266,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.loaded = true
 		h.loadedAt = time.Now()
 		h.err = msg.err
-		if msg.err == nil {
-			h.entries = msg.entries
-			h.stats = parser.ComputeStats(msg.entries)
-			h.buckets = parser.Bucketize(msg.entries, tabBucketSize(msg.tab))
+		if msg.err == nil && msg.agg != nil {
+			h.stats = msg.agg.ToStats()
+			h.buckets = msg.agg.ToBuckets()
 		}
 
 	case errMsg:
@@ -422,7 +422,7 @@ func (m model) renderHistory(idx int, label string) string {
 		return lipgloss.NewStyle().Padding(2, 4).
 			Render(styleBad.Render(fmt.Sprintf("Error: %v", h.err)))
 	}
-	if len(h.entries) == 0 {
+	if h.stats == nil || h.stats.TotalRequests == 0 {
 		return lipgloss.NewStyle().Padding(2, 4).
 			Render(styleDim.Render("No log entries found for this period."))
 	}
