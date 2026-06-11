@@ -105,6 +105,15 @@ type Bucket struct {
 	Bytes    int64
 }
 
+// ComputeStats builds a Stats object from a slice of log entries.
+func ComputeStats(entries []*LogEntry) *Stats {
+	s := NewStats()
+	for _, e := range entries {
+		s.Add(e)
+	}
+	return s
+}
+
 // Bucketize groups entries into buckets of the given duration.
 func Bucketize(entries []*LogEntry, bucketSize time.Duration) []Bucket {
 	if len(entries) == 0 {

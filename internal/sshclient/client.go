@@ -3,7 +3,6 @@ package sshclient
 import (
 	"bufio"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -217,5 +216,35 @@ func parseCPUStat(raw string) float64 {
 	return (totalDiff - idleDiff) / totalDiff * 100
 }
 
-// ensure net import is used (used in future dial variants)
-var _ = net.IPv4len
+// LoadHistoricalLines reads log lines newer than `since` from the main log file
+// and any rotated versions (access.log.1, access.log.2.gz, etc.).
+func (c *Client) LoadHistoricalLines(logPath string, since int64) ([]string, error) {
+	lastSlash := strings.LastIndex(logPath, "/")
+	dir, base := "/", logPath
+	if lastSlash >= 0 {
+		dir = logPath[:lastSlash]
+		if dir == "" {
+			dir = "/"
+		}
+		base = logPath[lastSlash+1:]
+	}
+
+	// Find all rotated log files, cat/zcat them, filter JSON lines by ts field.
+	// awk: find offset of "ts": then parse the numeric value after it.
+	cmd := fmt.Sprintf(
+		`find %s -name '%s*' -type f 2>/dev/null | sort -r | `+
+			`while read f; do case "$f" in *.gz) zcat "$f" ;; *) cat "$f" ;; esac; done 2>/dev/null | `+
+			`awk -v c=%d '{p=index($0,"\"ts\":"); if(p>0){v=substr($0,p+5,20)+0; if(v>=c) print}}'`,
+		dir, base, since,
+	)
+
+	out, err := c.RunCommand(cmd)
+	if err != nil && strings.TrimSpace(out) == "" {
+		return nil, fmt.Errorf("failed to read historical logs: %w", err)
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
