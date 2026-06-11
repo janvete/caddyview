@@ -83,13 +83,16 @@ var (
 
 // -- history state ------------------------------------------------------------
 
+const historyRefreshInterval = 5 * time.Minute
+
 type historyState struct {
-	entries []*parser.LogEntry
-	stats   *parser.Stats
-	buckets []parser.Bucket
-	loaded  bool
-	loading bool
-	err     error
+	entries  []*parser.LogEntry
+	stats    *parser.Stats
+	buckets  []parser.Bucket
+	loaded   bool
+	loading  bool
+	loadedAt time.Time
+	err      error
 }
 
 // -- messages -----------------------------------------------------------------
@@ -234,7 +237,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tickMsg:
-		return m, tea.Batch(tick(), drainLines(m.lineCh), fetchSysStats(m.client))
+		cmds := []tea.Cmd{tick(), drainLines(m.lineCh), fetchSysStats(m.client)}
+		if m.activeTab != tabLive {
+			if cmd := m.maybeRefreshHistory(m.activeTab); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		return m, tea.Batch(cmds...)
 
 	case newLineMsg:
 		if e := parser.ParseLine(string(msg)); e != nil {
@@ -254,6 +263,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h := m.history[idx]
 		h.loading = false
 		h.loaded = true
+		h.loadedAt = time.Now()
 		h.err = msg.err
 		if msg.err == nil {
 			h.entries = msg.entries
@@ -270,10 +280,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) ensureHistory(tab viewTab) tea.Cmd {
 	h := m.history[int(tab)-1]
-	if h.loaded || h.loading {
+	if h.loading {
 		return nil
 	}
-	h.loading = true
+	if !h.loaded {
+		h.loading = true // first load: show spinner
+		return loadHistory(m.client, m.logPath, tab)
+	}
+	if time.Since(h.loadedAt) > historyRefreshInterval {
+		// silent refresh: keep showing old data while new data loads
+		return loadHistory(m.client, m.logPath, tab)
+	}
+	return nil
+}
+
+// maybeRefreshHistory triggers a silent background reload for the active history
+// tab if its data is older than historyRefreshInterval.
+func (m *model) maybeRefreshHistory(tab viewTab) tea.Cmd {
+	h := m.history[int(tab)-1]
+	if h.loading || !h.loaded {
+		return nil
+	}
+	if time.Since(h.loadedAt) < historyRefreshInterval {
+		return nil
+	}
 	return loadHistory(m.client, m.logPath, tab)
 }
 
@@ -383,7 +413,7 @@ func (m model) renderHistory(idx int, label string) string {
 	h := m.history[idx]
 	if h.loading {
 		return lipgloss.NewStyle().Padding(2, 4).
-			Render(styleWarn.Render("⏳ Loading historical data…"))
+			Render(styleWarn.Render("Loading historical data…"))
 	}
 	if !h.loaded {
 		return lipgloss.NewStyle().Padding(2, 4).Render(styleDim.Render("No data loaded."))
@@ -397,8 +427,12 @@ func (m model) renderHistory(idx int, label string) string {
 			Render(styleDim.Render("No log entries found for this period."))
 	}
 
+	// Append "updated X ago" to label so the chart title reflects freshness
+	age := time.Since(h.loadedAt).Round(time.Second)
+	labelWithAge := fmt.Sprintf("%s — updated %s ago", label, age)
+
 	tab := viewTab(idx + 1)
-	chart := m.renderBarChart(h.buckets, tabBucketSize(tab), label, h.stats)
+	chart := m.renderBarChart(h.buckets, tabBucketSize(tab), labelWithAge, h.stats)
 	bottom := lipgloss.JoinHorizontal(lipgloss.Top,
 		m.renderPeriodStats(h.stats),
 		m.renderTopHosts(h.stats),
