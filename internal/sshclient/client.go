@@ -3,11 +3,13 @@ package sshclient
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 type Client struct {
@@ -140,17 +142,23 @@ func parseTarget(target string) (user, host string, err error) {
 }
 
 func buildAuthMethods(keyPath string) ([]ssh.AuthMethod, error) {
-	candidates := []string{}
+	var methods []ssh.AuthMethod
+
+	// SSH agent — uses whatever keys are loaded in the agent (macOS Keychain, ssh-add, etc.)
+	if m := agentAuth(); m != nil {
+		methods = append(methods, m)
+	}
+
+	// Explicit key file or common defaults
+	var candidates []string
 	if keyPath != "" {
 		candidates = append(candidates, keyPath)
 	} else {
 		home, _ := os.UserHomeDir()
-		candidates = append(candidates,
-			filepath.Join(home, ".ssh", "id_ed25519"),
-			filepath.Join(home, ".ssh", "id_rsa"),
-		)
+		for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+			candidates = append(candidates, filepath.Join(home, ".ssh", name))
+		}
 	}
-
 	for _, p := range candidates {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -160,10 +168,26 @@ func buildAuthMethods(keyPath string) ([]ssh.AuthMethod, error) {
 		if err != nil {
 			continue
 		}
-		return []ssh.AuthMethod{ssh.PublicKeys(signer)}, nil
+		methods = append(methods, ssh.PublicKeys(signer))
 	}
 
-	return nil, fmt.Errorf("no usable SSH private key found (tried: %v)", candidates)
+	if len(methods) == 0 {
+		return nil, fmt.Errorf("no SSH auth method available — no agent (SSH_AUTH_SOCK) and no key files found in %v", candidates)
+	}
+	return methods, nil
+}
+
+// agentAuth returns an auth method backed by the SSH agent if SSH_AUTH_SOCK is set.
+func agentAuth() ssh.AuthMethod {
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if sock == "" {
+		return nil
+	}
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil
+	}
+	return ssh.PublicKeysCallback(agent.NewClient(conn).Signers)
 }
 
 func parseMeminfo(raw string) (totalMB, usedMB int64) {
