@@ -64,20 +64,7 @@ func (c *Client) RunCommand(cmd string) (string, error) {
 	return string(out), err
 }
 
-// TailLines reads the last n lines of a remote file.
-func (c *Client) TailLines(path string, n int) ([]string, error) {
-	out, err := c.RunCommand(fmt.Sprintf("tail -n %d %s 2>/dev/null", n, path))
-	if err != nil {
-		return nil, fmt.Errorf("cannot read %s: %w", path, err)
-	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) == 1 && lines[0] == "" {
-		return nil, nil
-	}
-	return lines, nil
-}
-
-// StreamLines streams new lines from a remote file (like tail -f) into the channel.
+// StreamLines streams new lines from a remote file (like tail -F) into the channel.
 func (c *Client) StreamLines(path string, lines chan<- string, done <-chan struct{}) error {
 	session, err := c.conn.NewSession()
 	if err != nil {
@@ -90,7 +77,9 @@ func (c *Client) StreamLines(path string, lines chan<- string, done <-chan struc
 		return err
 	}
 
-	if err := session.Start(fmt.Sprintf("tail -n 0 -f %s 2>/dev/null", path)); err != nil {
+	// -F follows by name: Caddy rotates by renaming the file, which would
+	// silently kill a plain -f stream at every rotation.
+	if err := session.Start(fmt.Sprintf("tail -n 0 -F %s 2>/dev/null", path)); err != nil {
 		session.Close()
 		return err
 	}
@@ -98,6 +87,7 @@ func (c *Client) StreamLines(path string, lines chan<- string, done <-chan struc
 	go func() {
 		defer session.Close()
 		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			select {
 			case <-done:
@@ -241,27 +231,11 @@ func parseCPUStat(raw string) float64 {
 	return (totalDiff - idleDiff) / totalDiff * 100
 }
 
-// LoadAggregatedHistory aggregates log data on the remote server using awk,
-// returning only summary buckets instead of raw lines. This is critical for
-// high-traffic servers where raw line transfer would be impractical.
-//
-// bucketSecs: size of each time bucket in seconds (e.g. 3600 for hourly)
-// maxAgeDays: find only files modified within this many days (performance filter)
-func (c *Client) LoadAggregatedHistory(logPath string, since, bucketSecs int64, maxAgeDays int) (*parser.AggregatedHistory, error) {
-	lastSlash := strings.LastIndex(logPath, "/")
-	dir, base := "/", logPath
-	if lastSlash >= 0 {
-		dir = logPath[:lastSlash]
-		if dir == "" {
-			dir = "/"
-		}
-		base = logPath[lastSlash+1:]
-	}
-
-	// awk aggregation script — runs entirely on the server.
-	// Parses JSON log lines, groups by time bucket, outputs summary.
-	// Uses only POSIX-compatible awk constructs.
-	awkProg := `
+// historyAwkProg aggregates Caddy JSON log lines into hourly summary buckets.
+// It runs entirely on the server and uses only POSIX awk constructs (works
+// with gawk, mawk and busybox awk). IPs are capped to the top 50 per file so
+// the output stays small even on servers with millions of unique clients.
+const historyAwkProg = `
 BEGIN { OFS=" " }
 {
   if (index($0,"\"msg\":\"handled request\"") == 0) next
@@ -274,6 +248,8 @@ BEGIN { OFS=" " }
   st = (p>0) ? substr($0,p+9,5)+0 : 0
   p = index($0,"\"size\":")
   sz = (p>0) ? substr($0,p+7,15)+0 : 0
+  p = index($0,"\"duration\":")
+  du = (p>0) ? substr($0,p+11,14)+0 : 0
   p = index($0,"\"host\":\"")
   if (p>0) { rest=substr($0,p+8); q=index(rest,"\""); ho=(q>0)?substr(rest,1,q-1):"?" } else ho="?"
   p = index($0,"\"remote_ip\":\"")
@@ -284,7 +260,7 @@ BEGIN { OFS=" " }
   else if (st>=300) bs3[b]++
   else if (st>=200) bs2[b]++
   hc[ho]++; ic[ip]++
-  tot++; totb+=sz
+  tot++; totb+=sz; totd+=du
 }
 END {
   print "BUCKETS"
@@ -292,35 +268,69 @@ END {
   print "HOSTS"
   for (h in hc) print hc[h], h
   print "IPS"
-  for (i in ic) print ic[i], i
+  k = 50
+  for (i in ic) n++
+  while (k > 0 && n > 0) {
+    max = -1; mi = ""
+    for (i in ic) if (ic[i] > max) { max = ic[i]; mi = i }
+    print ic[mi], mi
+    delete ic[mi]
+    k--; n--
+  }
   print "TOTALS"
-  print tot+0, totb+0
+  print tot+0, totb+0, totd+0
 }`
 
-	// Cache file is keyed by log path + bucket size (not since, which changes every second).
-	// Cache is valid as long as no new .gz file appeared since it was written.
-	// A log rotation (every ~9 min on high-traffic servers) is the only invalidation event.
-	cacheKey := strings.NewReplacer("/", "_", ".", "_", "-", "_").Replace(base)
-	cachePath := fmt.Sprintf("/tmp/caddyview_%s_%d.cache", cacheKey, bucketSecs)
+// LoadAggregatedHistory aggregates log data on the remote server using awk,
+// returning only summary buckets instead of raw lines. This is critical for
+// high-traffic servers where raw line transfer would be impractical.
+//
+// Rotated log files are immutable, so each one is aggregated exactly once and
+// the result is cached on the server (/tmp/caddyview_*.cache); after a
+// rotation only the single new file is scanned. The current log file is always
+// scanned fresh, so the view never goes stale. Buckets are always hourly; the
+// caller re-buckets client-side, which lets all tabs share the same caches.
+//
+// since: unix cutoff for the current (still growing) log file
+// maxAgeDays: only look at files modified within this many days
+func (c *Client) LoadAggregatedHistory(logPath string, since int64, maxAgeDays int) (*parser.AggregatedHistory, error) {
+	lastSlash := strings.LastIndex(logPath, "/")
+	dir, base := "/", logPath
+	if lastSlash >= 0 {
+		dir = logPath[:lastSlash]
+		if dir == "" {
+			dir = "/"
+		}
+		base = logPath[lastSlash+1:]
+	}
 
-	findPipe := fmt.Sprintf(
-		`find %s -name '%s*' -type f -mtime -%d 2>/dev/null | sort -r | `+
-			`while read f; do case "$f" in *.gz) zcat "$f" ;; *) cat "$f" ;; esac; done 2>/dev/null | `+
-			`awk -v cutoff=%d -v bucket=%d '%s'`,
-		dir, base, maxAgeDays+1, since, bucketSecs, awkProg,
+	// Match both Caddy's native rotation naming (access-2026-06-12T10-30-00.000.log
+	// and .log.gz next to access.log) and classic logrotate naming (access.log.1.gz).
+	stem, ext := base, ""
+	if dot := strings.LastIndex(base, "."); dot > 0 {
+		stem, ext = base[:dot], base[dot:]
+	}
+	namePattern := fmt.Sprintf(
+		`\( -name '%s' -o -name '%s.*' -o -name '%s-*%s' -o -name '%s-*%s.gz' \)`,
+		base, base, stem, ext, stem, ext,
 	)
 
-	// Wrap with server-side cache: hit → instant cat; miss → run awk and tee to cache atomically.
 	cmd := fmt.Sprintf(
-		`CACHE=%s; `+
-			`LATEST=$(find %s -name '%s*.gz' -mtime -%d 2>/dev/null | sort | tail -1); `+
-			`if [ -f "$CACHE" ] && { [ -z "$LATEST" ] || [ "$CACHE" -nt "$LATEST" ]; }; then `+
-			`cat "$CACHE"; `+
+		`find /tmp -maxdepth 1 -name 'caddyview_*' -mtime +8 -delete 2>/dev/null; `+
+			`find %s %s -type f -mtime -%d 2>/dev/null | sort | while read -r f; do `+
+			`if [ "$f" = "%s" ]; then `+
+			`awk -v cutoff=%d -v bucket=3600 '%s' < "$f"; `+
 			`else `+
-			`TMPFILE=$(mktemp /tmp/caddyview.XXXXXX 2>/dev/null || echo /tmp/caddyview_fallback.tmp); `+
-			`%s | tee "$TMPFILE" && mv "$TMPFILE" "$CACHE" 2>/dev/null || cat "$TMPFILE" 2>/dev/null; `+
-			`fi`,
-		cachePath, dir, base, maxAgeDays+1, findPipe,
+			`key=$(printf '%%s' "$f" | tr -c 'A-Za-z0-9' '_'); c="/tmp/caddyview_${key}.cache"; `+
+			`if [ -s "$c" ] && [ "$c" -nt "$f" ]; then cat "$c"; else `+
+			`t=$(mktemp /tmp/caddyview.XXXXXX 2>/dev/null) || t="/tmp/caddyview_tmp.$$"; `+
+			`case "$f" in *.gz) zcat "$f" ;; *) cat "$f" ;; esac 2>/dev/null `+
+			`| awk -v cutoff=0 -v bucket=3600 '%s' > "$t" && mv "$t" "$c" && cat "$c" || cat "$t" 2>/dev/null; `+
+			`fi; fi; done`,
+		dir, namePattern, maxAgeDays+1,
+		logPath,
+		since, historyAwkProg,
+		historyAwkProg,
 	)
 
 	out, err := c.RunCommand(cmd)

@@ -18,67 +18,65 @@ import (
 type viewTab int
 
 const (
-	tabLive  viewTab = 0
-	tabDay   viewTab = 1
-	tabWeek  viewTab = 2
-	tabMonth viewTab = 3
+	tabLive viewTab = 0
+	tabDay  viewTab = 1
+	tabWeek viewTab = 2
 )
 
-var tabLabels = []string{"[1] Live", "[2] 1 Day", "[3] 1 Week", "[4] 1 Month"}
+var tabLabels = []string{"[1] LIVE", "[2] 1 DAY", "[3] 1 WEEK"}
 
 // tabWindow returns how far back each history tab reaches.
 func tabWindow(t viewTab) time.Duration {
-	switch t {
-	case tabDay:
-		return 24 * time.Hour
-	case tabWeek:
+	if t == tabWeek {
 		return 7 * 24 * time.Hour
-	case tabMonth:
-		return 30 * 24 * time.Hour
 	}
-	return 0
+	return 24 * time.Hour
 }
 
 // tabBucketSize returns the bucket granularity for the bar chart.
 func tabBucketSize(t viewTab) time.Duration {
-	switch t {
-	case tabDay:
-		return time.Hour
-	case tabWeek:
+	if t == tabWeek {
 		return 6 * time.Hour
-	case tabMonth:
-		return 24 * time.Hour
 	}
 	return time.Hour
 }
 
-// -- styles -------------------------------------------------------------------
+// -- styles (green phosphor / amber CRT palette) --------------------------------
 
 var (
+	colGreen  = lipgloss.Color("40")  // primary phosphor green
+	colBright = lipgloss.Color("46")  // highlights
+	colDark   = lipgloss.Color("28")  // borders
+	colFaint  = lipgloss.Color("22")  // empty bar fill
+	colDim    = lipgloss.Color("65")  // secondary text
+	colAmber  = lipgloss.Color("214") // warnings
+	colRed    = lipgloss.Color("160") // errors
+
 	styleBorder = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("62")).
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(colDark).
 			Padding(0, 1)
 
-	styleTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	styleTitle = lipgloss.NewStyle().Bold(true).Foreground(colBright)
 
-	styleHeader = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	styleHeader = lipgloss.NewStyle().Bold(true).Foreground(colGreen)
 
 	styleTabActive = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("16")).
-			Background(lipgloss.Color("62")).
+			Background(colGreen).
 			Padding(0, 1)
 
 	styleTabInactive = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("240")).
+				Foreground(colDim).
 				Padding(0, 1)
 
-	styleGood = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	styleWarn = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	styleBad  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	styleDim  = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	styleBar  = lipgloss.NewStyle().Foreground(lipgloss.Color("62"))
+	styleGood     = lipgloss.NewStyle().Foreground(colGreen)
+	styleWarn     = lipgloss.NewStyle().Foreground(colAmber)
+	styleBad      = lipgloss.NewStyle().Foreground(colRed)
+	styleDim      = lipgloss.NewStyle().Foreground(colDim)
+	styleBar      = lipgloss.NewStyle().Foreground(colGreen)
+	styleBarEmpty = lipgloss.NewStyle().Foreground(colFaint)
 )
 
 // -- history state ------------------------------------------------------------
@@ -97,16 +95,16 @@ type historyState struct {
 // -- messages -----------------------------------------------------------------
 
 type tickMsg time.Time
-type newLineMsg string
+type newLinesMsg []string
 type sysStatsMsg struct {
 	cpu      float64
 	memUsed  int64
 	memTotal int64
 }
 type historyLoadedMsg struct {
-	tab     viewTab
-	agg     *parser.AggregatedHistory
-	err     error
+	tab viewTab
+	agg *parser.AggregatedHistory
+	err error
 }
 type errMsg struct{ err error }
 
@@ -118,17 +116,17 @@ type model struct {
 	lineCh  chan string
 	doneCh  chan struct{}
 
-	liveEntries []*parser.LogEntry
-	liveStats   *parser.Stats
-	liveStart   time.Time
+	liveStats *parser.Stats
+	liveStart time.Time
 
 	activeTab viewTab
-	history   [3]*historyState
+	history   [2]*historyState
 
 	cpu      float64
 	memUsed  int64
 	memTotal int64
 
+	ticks  int
 	width  int
 	height int
 	err    error
@@ -138,7 +136,7 @@ func initialModel(client *sshclient.Client, logPath string) model {
 	m := model{
 		client:    client,
 		logPath:   logPath,
-		lineCh:    make(chan string, 256),
+		lineCh:    make(chan string, 8192),
 		doneCh:    make(chan struct{}),
 		liveStats: parser.NewStats(),
 		liveStart: time.Now(),
@@ -176,6 +174,8 @@ func tick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
+const sysStatsEvery = 5 // seconds; each fetch opens SSH sessions and sleeps 0.5s server-side
+
 func fetchSysStats(client *sshclient.Client) tea.Cmd {
 	return func() tea.Msg {
 		cpu, used, total, err := client.SysStats()
@@ -186,26 +186,38 @@ func fetchSysStats(client *sshclient.Client) tea.Cmd {
 	}
 }
 
+// drainLines grabs everything currently buffered in the channel as one batch,
+// so a traffic burst costs one Update/render cycle instead of one per line.
 func drainLines(ch chan string) tea.Cmd {
 	return func() tea.Msg {
-		select {
-		case line := <-ch:
-			return newLineMsg(line)
-		default:
-			return nil
+		var batch []string
+		for {
+			select {
+			case line := <-ch:
+				batch = append(batch, line)
+				if len(batch) >= 10000 {
+					return newLinesMsg(batch)
+				}
+			default:
+				if len(batch) == 0 {
+					return nil
+				}
+				return newLinesMsg(batch)
+			}
 		}
 	}
 }
 
 func loadHistory(client *sshclient.Client, logPath string, tab viewTab) tea.Cmd {
-	since := time.Now().Add(-tabWindow(tab)).Unix()
-	bucketSecs := int64(tabBucketSize(tab).Seconds())
-	maxAgeDays := int(tabWindow(tab).Hours()/24) + 1
+	window := tabWindow(tab)
+	since := time.Now().Add(-window).Unix()
+	maxAgeDays := int(window.Hours()/24) + 1
 	return func() tea.Msg {
-		agg, err := client.LoadAggregatedHistory(logPath, since, bucketSecs, maxAgeDays)
+		agg, err := client.LoadAggregatedHistory(logPath, since, maxAgeDays)
 		if err != nil {
 			return historyLoadedMsg{tab: tab, err: err}
 		}
+		agg.FilterSince(since)
 		return historyLoadedMsg{tab: tab, agg: agg}
 	}
 }
@@ -232,13 +244,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "3":
 			m.activeTab = tabWeek
 			return m, m.ensureHistory(tabWeek)
-		case "4":
-			m.activeTab = tabMonth
-			return m, m.ensureHistory(tabMonth)
 		}
 
 	case tickMsg:
-		cmds := []tea.Cmd{tick(), drainLines(m.lineCh), fetchSysStats(m.client)}
+		m.ticks++
+		cmds := []tea.Cmd{tick(), drainLines(m.lineCh)}
+		if m.ticks%sysStatsEvery == 0 {
+			cmds = append(cmds, fetchSysStats(m.client))
+		}
 		if m.activeTab != tabLive {
 			if cmd := m.maybeRefreshHistory(m.activeTab); cmd != nil {
 				cmds = append(cmds, cmd)
@@ -246,12 +259,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
-	case newLineMsg:
-		if e := parser.ParseLine(string(msg)); e != nil {
-			m.liveStats.Add(e)
-			m.liveEntries = append(m.liveEntries, e)
-			if len(m.liveEntries) > 10000 {
-				m.liveEntries = m.liveEntries[len(m.liveEntries)-10000:]
+	case newLinesMsg:
+		for _, line := range msg {
+			if e := parser.ParseLine(line); e != nil {
+				m.liveStats.Add(e)
 			}
 		}
 		return m, drainLines(m.lineCh)
@@ -268,7 +279,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.err = msg.err
 		if msg.err == nil && msg.agg != nil {
 			h.stats = msg.agg.ToStats()
-			h.buckets = msg.agg.ToBuckets()
+			h.buckets = msg.agg.ToBuckets(tabBucketSize(msg.tab))
 		}
 
 	case errMsg:
@@ -311,7 +322,7 @@ func (m *model) maybeRefreshHistory(tab viewTab) tea.Cmd {
 
 func (m model) View() string {
 	if m.err != nil {
-		return styleBad.Render(fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err))
+		return styleBad.Render(fmt.Sprintf("ERROR: %v\n\nPress q to quit.", m.err))
 	}
 	parts := []string{
 		m.renderHeader(),
@@ -321,13 +332,11 @@ func (m model) View() string {
 	case tabLive:
 		parts = append(parts, m.renderLive())
 	case tabDay:
-		parts = append(parts, m.renderHistory(0, "last 24 hours"))
+		parts = append(parts, m.renderHistory(0, "LAST 24 HOURS"))
 	case tabWeek:
-		parts = append(parts, m.renderHistory(1, "last 7 days"))
-	case tabMonth:
-		parts = append(parts, m.renderHistory(2, "last 30 days"))
+		parts = append(parts, m.renderHistory(1, "LAST 7 DAYS"))
 	}
-	parts = append(parts, styleDim.Render("  1 live  2 day  3 week  4 month  q quit"))
+	parts = append(parts, styleDim.Render("  [1] LIVE   [2] 1 DAY   [3] 1 WEEK   [Q] QUIT"))
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
@@ -349,21 +358,21 @@ func (m model) renderHeader() string {
 		memColor = styleWarn
 	}
 	row := strings.Join([]string{
-		styleTitle.Render("caddyview"),
+		styleTitle.Render("░▒▓ CADDYVIEW ▓▒░"),
 		"  ",
-		styleHeader.Render("host: ") + m.client.Host(),
+		styleHeader.Render("HOST: ") + m.client.Host(),
 		"  ",
-		styleHeader.Render("log: ") + styleDim.Render(m.logPath),
+		styleHeader.Render("LOG: ") + styleDim.Render(m.logPath),
 		"  ",
-		styleHeader.Render("up: ") + time.Since(m.liveStart).Round(time.Second).String(),
+		styleHeader.Render("UP: ") + time.Since(m.liveStart).Round(time.Second).String(),
 		"  ",
 		styleHeader.Render("CPU: ") + cpuColor.Render(fmt.Sprintf("%.1f%%", m.cpu)),
 		"  ",
 		styleHeader.Render("MEM: ") + memColor.Render(fmt.Sprintf("%d/%d MB (%.0f%%)", m.memUsed, m.memTotal, memPct)),
 	}, "")
 	return lipgloss.NewStyle().
-		BorderBottom(true).BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("62")).Width(m.width).
+		BorderBottom(true).BorderStyle(lipgloss.DoubleBorder()).
+		BorderForeground(colDark).Width(m.width).
 		Render(row)
 }
 
@@ -378,7 +387,7 @@ func (m model) renderTabBar() string {
 	}
 	return lipgloss.NewStyle().
 		BorderBottom(true).BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("62")).Width(m.width).
+		BorderForeground(colDark).Width(m.width).
 		Render(strings.Join(tabs, " "))
 }
 
@@ -391,7 +400,7 @@ func (m model) renderLive() string {
 		rps = float64(m.liveStats.TotalRequests) / elapsed
 	}
 	statsBox := styleBorder.Render(strings.Join([]string{
-		styleHeader.Render("Live Stats"),
+		styleHeader.Render("LIVE STATS"),
 		"",
 		fmt.Sprintf("Requests  : %s", styleGood.Render(formatComma(m.liveStats.TotalRequests))),
 		fmt.Sprintf("Req/sec   : %s", styleGood.Render(fmt.Sprintf("%.2f", rps))),
@@ -413,14 +422,14 @@ func (m model) renderHistory(idx int, label string) string {
 	h := m.history[idx]
 	if h.loading {
 		return lipgloss.NewStyle().Padding(2, 4).
-			Render(styleWarn.Render("Loading historical data…"))
+			Render(styleWarn.Render("▒▒ LOADING HISTORY ▒▒"))
 	}
 	if !h.loaded {
 		return lipgloss.NewStyle().Padding(2, 4).Render(styleDim.Render("No data loaded."))
 	}
 	if h.err != nil {
 		return lipgloss.NewStyle().Padding(2, 4).
-			Render(styleBad.Render(fmt.Sprintf("Error: %v", h.err)))
+			Render(styleBad.Render(fmt.Sprintf("ERROR: %v", h.err)))
 	}
 	if h.stats == nil || h.stats.TotalRequests == 0 {
 		return lipgloss.NewStyle().Padding(2, 4).
@@ -476,7 +485,7 @@ func (m model) renderBarChart(buckets []parser.Bucket, bucketSize time.Duration,
 		barMax = 10
 	}
 
-	title := fmt.Sprintf("Requests / %s — %s — total: %s req, %s",
+	title := fmt.Sprintf("REQUESTS / %s — %s — TOTAL: %s req, %s",
 		bucketSizeLabel(bucketSize), label,
 		formatComma(stats.TotalRequests), formatBytes(stats.TotalBytes),
 	)
@@ -487,10 +496,11 @@ func (m model) renderBarChart(buckets []parser.Bucket, bucketSize time.Duration,
 		if maxReqs > 0 {
 			barLen = int(math.Round(float64(b.Requests) / float64(maxReqs) * float64(barMax)))
 		}
-		bar := strings.Repeat("█", barLen)
+		bar := styleBar.Render(strings.Repeat("▓", barLen)) +
+			styleBarEmpty.Render(strings.Repeat("░", barMax-barLen))
 		rows = append(rows, fmt.Sprintf("%-*s %s %s",
 			labelW, b.Time.Format(timeFmt),
-			styleBar.Render(fmt.Sprintf("%-*s", barMax, bar)),
+			bar,
 			styleDim.Render(formatComma(b.Requests)),
 		))
 	}
@@ -502,7 +512,7 @@ func (m model) renderBarChart(buckets []parser.Bucket, bucketSize time.Duration,
 
 func (m model) renderPeriodStats(stats *parser.Stats) string {
 	return styleBorder.Render(strings.Join([]string{
-		styleHeader.Render("Period Stats"),
+		styleHeader.Render("PERIOD STATS"),
 		"",
 		fmt.Sprintf("Requests : %s", styleGood.Render(formatComma(stats.TotalRequests))),
 		fmt.Sprintf("Transfer : %s", formatBytes(stats.TotalBytes)),
@@ -511,7 +521,7 @@ func (m model) renderPeriodStats(stats *parser.Stats) string {
 }
 
 func (m model) renderTopHosts(stats *parser.Stats) string {
-	rows := []string{styleHeader.Render("Top Hosts"), ""}
+	rows := []string{styleHeader.Render("TOP HOSTS"), ""}
 	for _, p := range topN(stats.TopHosts, 8) {
 		host := p.key
 		if len(host) > 30 {
@@ -526,7 +536,7 @@ func (m model) renderTopHosts(stats *parser.Stats) string {
 }
 
 func (m model) renderTopIPs(stats *parser.Stats) string {
-	rows := []string{styleHeader.Render("Top IPs"), ""}
+	rows := []string{styleHeader.Render("TOP IPS"), ""}
 	for _, p := range topN(stats.TopIPs, 8) {
 		rows = append(rows, fmt.Sprintf("%-20s %s", p.key, styleGood.Render(formatComma(p.val))))
 	}
@@ -550,7 +560,7 @@ func (m model) renderStatusCodes(stats *parser.Stats) string {
 			groups["5xx"] += n
 		}
 	}
-	rows := []string{styleHeader.Render("Status Codes"), ""}
+	rows := []string{styleHeader.Render("STATUS CODES"), ""}
 	for _, g := range []string{"2xx", "3xx", "4xx", "5xx"} {
 		s := formatComma(groups[g])
 		var colored string
@@ -601,12 +611,19 @@ type kv struct {
 	val int64
 }
 
+// topN returns the n highest entries. Ties are broken alphabetically so rows
+// with equal counts keep a stable order between renders instead of flickering.
 func topN(m map[string]int64, n int) []kv {
 	pairs := make([]kv, 0, len(m))
 	for k, v := range m {
 		pairs = append(pairs, kv{k, v})
 	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].val > pairs[j].val })
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].val != pairs[j].val {
+			return pairs[i].val > pairs[j].val
+		}
+		return pairs[i].key < pairs[j].key
+	})
 	if len(pairs) > n {
 		return pairs[:n]
 	}
@@ -616,11 +633,11 @@ func topN(m map[string]int64, n int) []kv {
 func bucketSizeLabel(d time.Duration) string {
 	switch {
 	case d >= 24*time.Hour:
-		return "day"
+		return "DAY"
 	case d >= time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
+		return fmt.Sprintf("%dH", int(d.Hours()))
 	default:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
+		return fmt.Sprintf("%dM", int(d.Minutes()))
 	}
 }
 

@@ -3,6 +3,7 @@ package parser
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -47,17 +48,6 @@ func ParseLine(line string) *LogEntry {
 	return &entry
 }
 
-// ParseLines parses multiple lines and returns valid entries.
-func ParseLines(lines []string) []*LogEntry {
-	entries := make([]*LogEntry, 0, len(lines))
-	for _, l := range lines {
-		if e := ParseLine(l); e != nil {
-			entries = append(entries, e)
-		}
-	}
-	return entries
-}
-
 // -- Stats (used for live view and derived from AggregatedHistory for history) --
 
 type Stats struct {
@@ -100,14 +90,6 @@ func (s *Stats) BytesPerSec(windowSecs float64) float64 {
 	return float64(s.TotalBytes) / windowSecs
 }
 
-func ComputeStats(entries []*LogEntry) *Stats {
-	s := NewStats()
-	for _, e := range entries {
-		s.Add(e)
-	}
-	return s
-}
-
 // -- Bucket (time-series bar chart data) --------------------------------------
 
 type Bucket struct {
@@ -116,43 +98,47 @@ type Bucket struct {
 	Bytes    int64
 }
 
-func Bucketize(entries []*LogEntry, bucketSize time.Duration) []Bucket {
-	if len(entries) == 0 {
-		return nil
-	}
-	buckets := map[int64]*Bucket{}
-	for _, e := range entries {
-		t := e.Time().Truncate(bucketSize)
-		key := t.Unix()
-		if _, ok := buckets[key]; !ok {
-			buckets[key] = &Bucket{Time: t}
-		}
-		buckets[key].Requests++
-		buckets[key].Bytes += e.Size
-	}
-	result := make([]Bucket, 0, len(buckets))
-	for _, b := range buckets {
-		result = append(result, *b)
-	}
-	return result
-}
-
 // -- AggregatedHistory (server-side aggregation result) -----------------------
 
 // AggregatedBucket is one time bucket returned by server-side awk aggregation.
 type AggregatedBucket struct {
-	Time                          time.Time
-	Requests, Bytes               int64
+	Time                                       time.Time
+	Requests, Bytes                            int64
 	Status2xx, Status3xx, Status4xx, Status5xx int64
 }
 
-// AggregatedHistory holds the full result of a server-side history aggregation.
+// AggregatedHistory holds the merged result of per-file server-side aggregations.
 type AggregatedHistory struct {
 	Buckets    []AggregatedBucket
 	TopHosts   map[string]int64
 	TopIPs     map[string]int64
 	TotalReqs  int64
 	TotalBytes int64
+	DurSumSecs float64
+}
+
+// FilterSince drops buckets older than the window and recomputes totals from
+// the remaining buckets, so the chart and the totals always agree. TopHosts and
+// TopIPs come from whole rotated files and may slightly overcount at the oldest
+// edge of the window — acceptable for a monitoring view.
+func (h *AggregatedHistory) FilterSince(since int64) {
+	avgDur := 0.0
+	if h.TotalReqs > 0 {
+		avgDur = h.DurSumSecs / float64(h.TotalReqs)
+	}
+	kept := h.Buckets[:0]
+	var reqs, bytes int64
+	for _, b := range h.Buckets {
+		if b.Time.Unix() >= since {
+			kept = append(kept, b)
+			reqs += b.Requests
+			bytes += b.Bytes
+		}
+	}
+	h.Buckets = kept
+	h.TotalReqs = reqs
+	h.TotalBytes = bytes
+	h.DurSumSecs = avgDur * float64(reqs)
 }
 
 // ToStats converts aggregated history to a Stats object for use in the TUI panels.
@@ -162,6 +148,9 @@ func (h *AggregatedHistory) ToStats() *Stats {
 	s.TotalBytes = h.TotalBytes
 	s.TopHosts = h.TopHosts
 	s.TopIPs = h.TopIPs
+	if h.TotalReqs > 0 {
+		s.AvgDurationMs = h.DurSumSecs / float64(h.TotalReqs) * 1000
+	}
 	for _, b := range h.Buckets {
 		s.StatusCodes[200] += b.Status2xx
 		s.StatusCodes[301] += b.Status3xx
@@ -171,18 +160,37 @@ func (h *AggregatedHistory) ToStats() *Stats {
 	return s
 }
 
-// ToBuckets converts aggregated buckets to the Bucket slice used by the bar chart.
-func (h *AggregatedHistory) ToBuckets() []Bucket {
-	out := make([]Bucket, len(h.Buckets))
-	for i, ab := range h.Buckets {
-		out[i] = Bucket{Time: ab.Time, Requests: ab.Requests, Bytes: ab.Bytes}
+// ToBuckets re-buckets the hourly server-side buckets into the granularity the
+// chart wants (e.g. 6h for the week view) and returns them sorted by time.
+func (h *AggregatedHistory) ToBuckets(size time.Duration) []Bucket {
+	secs := int64(size.Seconds())
+	if secs < 1 {
+		secs = 1
 	}
+	merged := map[int64]*Bucket{}
+	for _, ab := range h.Buckets {
+		ts := ab.Time.Unix() / secs * secs
+		b, ok := merged[ts]
+		if !ok {
+			b = &Bucket{Time: time.Unix(ts, 0)}
+			merged[ts] = b
+		}
+		b.Requests += ab.Requests
+		b.Bytes += ab.Bytes
+	}
+	out := make([]Bucket, 0, len(merged))
+	for _, b := range merged {
+		out = append(out, *b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
 	return out
 }
 
-// ParseAggregatedOutput parses the output of the server-side awk aggregation script.
+// ParseAggregatedOutput parses the concatenated output of per-file server-side
+// awk aggregations. Sections may repeat (one set per log file) and are merged:
+// bucket counts sum by timestamp, host/IP counts sum by key, totals sum.
 //
-// Format:
+// Per-file format:
 //
 //	BUCKETS
 //	<unix_ts> <count> <bytes> <2xx> <3xx> <4xx> <5xx>
@@ -191,14 +199,16 @@ func (h *AggregatedHistory) ToBuckets() []Bucket {
 //	IPS
 //	<count> <ip>
 //	TOTALS
-//	<total_reqs> <total_bytes>
+//	<total_reqs> <total_bytes> <duration_sum_secs>
 func ParseAggregatedOutput(raw string) (*AggregatedHistory, error) {
 	h := &AggregatedHistory{
 		TopHosts: make(map[string]int64),
 		TopIPs:   make(map[string]int64),
 	}
+	bucketsByTS := map[int64]*AggregatedBucket{}
 
 	section := ""
+	sawSection := false
 	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -207,6 +217,7 @@ func ParseAggregatedOutput(raw string) (*AggregatedHistory, error) {
 		switch line {
 		case "BUCKETS", "HOSTS", "IPS", "TOTALS":
 			section = line
+			sawSection = true
 			continue
 		}
 
@@ -220,14 +231,18 @@ func ParseAggregatedOutput(raw string) (*AggregatedHistory, error) {
 			if err != nil {
 				continue
 			}
-			ab := AggregatedBucket{Time: time.Unix(ts, 0)}
-			ab.Requests, _ = strconv.ParseInt(fields[1], 10, 64)
-			ab.Bytes, _ = strconv.ParseInt(fields[2], 10, 64)
-			ab.Status2xx, _ = strconv.ParseInt(fields[3], 10, 64)
-			ab.Status3xx, _ = strconv.ParseInt(fields[4], 10, 64)
-			ab.Status4xx, _ = strconv.ParseInt(fields[5], 10, 64)
-			ab.Status5xx, _ = strconv.ParseInt(fields[6], 10, 64)
-			h.Buckets = append(h.Buckets, ab)
+			ab, ok := bucketsByTS[ts]
+			if !ok {
+				ab = &AggregatedBucket{Time: time.Unix(ts, 0)}
+				bucketsByTS[ts] = ab
+			}
+			n := func(i int) int64 { v, _ := strconv.ParseInt(fields[i], 10, 64); return v }
+			ab.Requests += n(1)
+			ab.Bytes += n(2)
+			ab.Status2xx += n(3)
+			ab.Status3xx += n(4)
+			ab.Status4xx += n(5)
+			ab.Status5xx += n(6)
 
 		case "HOSTS":
 			if len(fields) < 2 {
@@ -235,26 +250,38 @@ func ParseAggregatedOutput(raw string) (*AggregatedHistory, error) {
 			}
 			count, _ := strconv.ParseInt(fields[0], 10, 64)
 			host := strings.Join(fields[1:], " ")
-			h.TopHosts[host] = count
+			h.TopHosts[host] += count
 
 		case "IPS":
 			if len(fields) < 2 {
 				continue
 			}
 			count, _ := strconv.ParseInt(fields[0], 10, 64)
-			h.TopIPs[fields[1]] = count
+			h.TopIPs[fields[1]] += count
 
 		case "TOTALS":
 			if len(fields) < 2 {
 				continue
 			}
-			h.TotalReqs, _ = strconv.ParseInt(fields[0], 10, 64)
-			h.TotalBytes, _ = strconv.ParseInt(fields[1], 10, 64)
+			reqs, _ := strconv.ParseInt(fields[0], 10, 64)
+			bytes, _ := strconv.ParseInt(fields[1], 10, 64)
+			h.TotalReqs += reqs
+			h.TotalBytes += bytes
+			if len(fields) >= 3 {
+				dur, _ := strconv.ParseFloat(fields[2], 64)
+				h.DurSumSecs += dur
+			}
 		}
 	}
 
-	if section == "" {
+	if !sawSection {
 		return nil, fmt.Errorf("no aggregation output received from server")
 	}
+
+	h.Buckets = make([]AggregatedBucket, 0, len(bucketsByTS))
+	for _, ab := range bucketsByTS {
+		h.Buckets = append(h.Buckets, *ab)
+	}
+	sort.Slice(h.Buckets, func(i, j int) bool { return h.Buckets[i].Time.Before(h.Buckets[j].Time) })
 	return h, nil
 }
