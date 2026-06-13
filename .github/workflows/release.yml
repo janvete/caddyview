@@ -56,7 +56,7 @@ jobs:
           SHA_AMD64=$(sha256sum dist/caddyview-${VERSION}-darwin-amd64.tar.gz | awk '{print $1}')
           SHA_LINUX=$(sha256sum dist/caddyview-${VERSION}-linux-amd64.tar.gz  | awk '{print $1}')
 
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/janvete/homebrew-caddyview.git" tap
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/janvete/homebrew-tools.git" tap
 
           cat > tap/Formula/caddyview.rb << FORMULA
           class Caddyview < Formula
